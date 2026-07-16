@@ -1444,7 +1444,7 @@ impl FileFragment {
     }
 
     /// Get the file metadata for this fragment, using the cache if available.
-    async fn get_file_metadata(
+    pub async fn get_file_metadata(
         &self,
         file_scheduler: &FileScheduler,
     ) -> Result<Arc<CachedFileMetadata>> {
