@@ -1074,6 +1074,7 @@ pub(crate) async fn commit_transaction(
                 if !indices.is_empty() {
                     let key = IndexMetadataKey {
                         version: target_version,
+                        store_identity: &dataset.object_store.store_prefix,
                     };
                     dataset
                         .index_cache
