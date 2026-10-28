@@ -1001,6 +1001,7 @@ impl MergeInsertJob {
                             .open(
                                 dataset.schema(),
                                 FragReadConfig::default().with_row_address(true),
+                                None,
                             )
                             .await?;
                         let batch_size = reader.legacy_num_rows_in_batch(0).unwrap();

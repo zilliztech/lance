@@ -1084,7 +1084,7 @@ impl FilteredReadStream {
         let read_schema = fragment_read_task.projection.to_bare_schema();
         let mut fragment_reader = fragment_read_task
             .fragment
-            .open(&read_schema, fragment_read_task.frag_read_config())
+            .open(&read_schema, fragment_read_task.frag_read_config(), None)
             .await?;
 
         if fragment_read_task.with_deleted_rows {

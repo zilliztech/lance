@@ -224,7 +224,7 @@ async fn do_take_rows(
             .with_row_address(with_row_addr_in_projection)
             .with_row_created_at_version(with_row_created_at_version_in_projection)
             .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection);
-        let reader = fragment.open(&physical_schema, read_config).await?;
+        let reader = fragment.open(&physical_schema, read_config, None).await?;
         reader.legacy_read_range_as_batch(range).await
     } else if row_addr_stats.sorted {
         // Don't need to re-arrange data, just concatenate

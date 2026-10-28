@@ -134,6 +134,7 @@ impl TakeStream {
                 .open(
                     &self.fields_to_take,
                     FragReadConfig::default().with_scan_scheduler(self.scan_scheduler.clone()),
+                    None,
                 )
                 .await?,
         );

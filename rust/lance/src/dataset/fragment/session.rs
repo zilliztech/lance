@@ -30,6 +30,7 @@ impl FragmentSession {
             .open(
                 projection,
                 FragReadConfig::default().with_row_address(with_row_address),
+                None,
             )
             .await?;
 

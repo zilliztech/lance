@@ -56,7 +56,9 @@ async fn open_file(
             .with_reader_priority(reader_priority);
     }
 
-    let mut reader = file_fragment.open(projection.as_ref(), read_config).await?;
+    let mut reader = file_fragment
+        .open(projection.as_ref(), read_config, None)
+        .await?;
 
     if with_make_deletions_null {
         reader.with_make_deletions_null();

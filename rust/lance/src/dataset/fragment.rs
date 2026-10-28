@@ -671,6 +671,10 @@ pub struct FragReadConfig {
     pub file_reader_options: Option<FileReaderOptions>,
 }
 
+/// Loaded v2 file metadata, keyed by the manifest's `(base_id, path)`.
+/// Each entry must describe the corresponding immutable physical file.
+pub type FileMetadataMap = HashMap<(Option<u32>, String), Arc<CachedFileMetadata>>;
+
 impl FragReadConfig {
     pub fn with_row_id(mut self, value: bool) -> Self {
         self.with_row_id = value;
@@ -842,6 +846,7 @@ impl FileFragment {
             .open_readers(
                 dataset_schema,
                 &FragReadConfig::default().with_scan_scheduler(scan_scheduler),
+                None,
             )
             .await?
         {
@@ -890,17 +895,34 @@ impl FileFragment {
     /// Parameters
     /// - `projection`: The projection schema.
     /// - `read_config`: Controls what columns are included in the output.
-    /// - `scan_scheduler`: The scheduler to use for reading data files.  If not supplied
-    ///   and the data is v2 data then a new scheduler will be created
+    /// - `file_metadata`: Optional caller-owned metadata for v2 data files. When
+    ///   absent, or when an entry is missing, use the normal metadata-loading path.
+    ///   Legacy files always use the normal path.
     ///
     /// `projection` may be an empty schema only if `with_row_id` is true. In that
     /// case, the reader will only be generating row ids.
+    ///
+    /// Metadata entries must come from the immutable files identified by
+    /// `(base_id, path)` in this fragment's manifest. Matching entries bypass the
+    /// session cache and provide the file size, avoiding both footer reads and size
+    /// lookups. Readers retain an `Arc` to each used entry; the caller may drop the
+    /// map after opening.
+    ///
+    /// ```
+    /// # use lance::dataset::fragment::{FileFragment, FileMetadataMap, FragReadConfig};
+    /// # use lance_core::datatypes::Schema;
+    /// # async fn example(fragment: &FileFragment, schema: &Schema, metadata: &FileMetadataMap) -> lance::Result<()> {
+    /// let reader = fragment.open(schema, FragReadConfig::default(), Some(metadata)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn open(
         &self,
         projection: &Schema,
         read_config: FragReadConfig,
+        file_metadata: Option<&FileMetadataMap>,
     ) -> Result<FragmentReader> {
-        let open_files = self.open_readers(projection, &read_config);
+        let open_files = self.open_readers(projection, &read_config, file_metadata);
         let deletion_vec_load = self.get_deletion_vector();
 
         let row_id_load = if self.dataset.manifest.uses_stable_row_ids() {
@@ -963,6 +985,7 @@ impl FileFragment {
         data_file: &DataFile,
         projection: Option<&Schema>,
         read_config: &FragReadConfig,
+        file_metadata: Option<&FileMetadataMap>,
     ) -> Result<Option<Box<dyn GenericFileReader>>> {
         let full_schema = self.dataset.schema();
         // The data file may contain fields that are not part of the dataset any longer, remove those
@@ -1030,10 +1053,41 @@ impl FileFragment {
                     0,
                 )
             };
+            let supplied = file_metadata
+                .and_then(|metadata| metadata.get(&(data_file.base_id, data_file.path.clone())));
+            if let Some(metadata) = supplied
+                && (u32::from(metadata.major_version) != data_file.file_major_version
+                    || u32::from(metadata.minor_version) != data_file.file_minor_version
+                    || self
+                        .metadata
+                        .physical_rows
+                        .is_some_and(|rows| rows as u64 != metadata.num_rows)
+                    || metadata.file_size_bytes == 0
+                    || data_file
+                        .file_size_bytes
+                        .get()
+                        .is_some_and(|size| size.get() != metadata.file_size_bytes))
+            {
+                return Err(Error::invalid_input(format!(
+                    "Supplied file metadata does not match fragment {} file {} (base_id {:?})",
+                    self.id(),
+                    data_file.path,
+                    data_file.base_id
+                )));
+            }
+            let supplied_size =
+                supplied.map(|metadata| CachedFileSize::new(metadata.file_size_bytes));
             let file_scheduler = store_scheduler
-                .open_file_with_priority(&path, reader_priority as u64, &data_file.file_size_bytes)
+                .open_file_with_priority(
+                    &path,
+                    reader_priority as u64,
+                    supplied_size.as_ref().unwrap_or(&data_file.file_size_bytes),
+                )
                 .await?;
-            let file_metadata = self.get_file_metadata(&file_scheduler).await?;
+            let file_metadata = match supplied {
+                Some(metadata) => metadata.clone(),
+                None => self.get_file_metadata(&file_scheduler).await?,
+            };
             let path = file_scheduler.reader().path().clone();
             let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
             let reader = Arc::new(
@@ -1081,11 +1135,12 @@ impl FileFragment {
         &self,
         projection: &Schema,
         read_config: &FragReadConfig,
+        file_metadata: Option<&FileMetadataMap>,
     ) -> Result<Vec<Box<dyn GenericFileReader>>> {
         let mut opened_files = vec![];
         for data_file in &self.metadata.files {
             if let Some(reader) = self
-                .open_reader(data_file, Some(projection), read_config)
+                .open_reader(data_file, Some(projection), read_config, file_metadata)
                 .await?
             {
                 opened_files.push(reader);
@@ -1230,7 +1285,7 @@ impl FileFragment {
         // Just open any file. All of them should have same size.
         let some_file = &self.metadata.files[0];
         let reader = self
-            .open_reader(some_file, None, &FragReadConfig::default())
+            .open_reader(some_file, None, &FragReadConfig::default(), None)
             .await?
             .ok_or_else(|| {
                 Error::internal(format!(
@@ -1301,7 +1356,7 @@ impl FileFragment {
         let get_lengths = self.metadata.files.iter().map(|data_file| async move {
             let data_file_dir = self.dataset.data_file_dir(data_file)?;
             let reader = self
-                .open_reader(data_file, None, &FragReadConfig::default())
+                .open_reader(data_file, None, &FragReadConfig::default(), None)
                 .await?
                 .ok_or_else(|| {
                     Error::corrupt_file(
@@ -1487,6 +1542,7 @@ impl FileFragment {
                     .with_row_address(with_row_address)
                     .with_row_created_at_version(with_row_created_at_version)
                     .with_row_last_updated_at_version(with_row_last_updated_at_version),
+                None,
             )
             .await?;
 
@@ -1573,6 +1629,7 @@ impl FileFragment {
             FragReadConfig::default()
                 .with_row_address(with_row_addr)
                 .with_row_id(with_row_id),
+            None,
         );
         let deletion_vector = self.get_deletion_vector();
         let (reader, deletion_vector) = join!(reader, deletion_vector);
@@ -3127,6 +3184,7 @@ mod tests {
                 .open(
                     fragment.schema(),
                     FragReadConfig::default().with_row_id(with_row_id),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3151,6 +3209,7 @@ mod tests {
                 .open(
                     fragment.schema(),
                     FragReadConfig::default().with_row_id(with_row_id),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3190,6 +3249,7 @@ mod tests {
                     FragReadConfig::default()
                         .with_row_id(with_row_id)
                         .with_row_address(with_row_address),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3216,6 +3276,7 @@ mod tests {
                     FragReadConfig::default()
                         .with_row_id(with_row_id)
                         .with_row_address(with_row_address),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3251,6 +3312,7 @@ mod tests {
             .open(
                 dataset.schema(),
                 FragReadConfig::default().with_row_id(true),
+                None,
             )
             .await
             .unwrap();
@@ -3346,6 +3408,7 @@ mod tests {
                 .open(
                     dataset.schema(),
                     FragReadConfig::default().with_row_id(true),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3923,7 +3986,7 @@ mod tests {
             .get_fragments()
             .first()
             .unwrap()
-            .open(dataset.schema(), FragReadConfig::default())
+            .open(dataset.schema(), FragReadConfig::default(), None)
             .await?;
         let actual_data = reader.take_as_batch(&[0, 1, 2], None).await?;
         assert_eq!(expected_data.slice(0, 3), actual_data);
@@ -3978,6 +4041,7 @@ mod tests {
             .open(
                 &dataset.schema().project::<&str>(&[])?,
                 FragReadConfig::default().with_row_id(true),
+                None,
             )
             .await?;
         let batch = reader.legacy_read_range_as_batch(0..20).await?;
@@ -3993,6 +4057,7 @@ mod tests {
             .open(
                 &dataset.schema().project::<&str>(&[])?,
                 FragReadConfig::default(),
+                None,
             )
             .await;
         assert!(matches!(res, Err(Error::NotFound { .. })));
@@ -4060,6 +4125,101 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::known_deletion_count(false)]
+    #[case::missing_deletion_count(true)]
+    #[tokio::test]
+    async fn test_open_with_file_metadata_multiple_files(#[case] missing_deletion_count: bool) {
+        let test_dir = TempStrDir::default();
+        let mut dataset = create_dataset_v2(&test_dir).await;
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("extra".into(), "i + i".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        dataset.delete("i < 2").await.unwrap();
+        let mut manifest = dataset.manifest().clone();
+        if missing_deletion_count {
+            Arc::make_mut(&mut manifest.fragments)[0]
+                .deletion_file
+                .as_mut()
+                .unwrap()
+                .num_deleted_rows = None;
+        }
+        let dataset = crate::dataset::builder::DatasetBuilder::from_uri(&test_dir)
+            .with_serialized_manifest(&manifest.serialized())
+            .unwrap()
+            .with_session(Arc::new(Session::new(0, 0, Default::default())))
+            .load()
+            .await
+            .unwrap();
+        let fragment = dataset.get_fragment(0).unwrap();
+        assert_eq!(fragment.metadata.files.len(), 2);
+        let scheduler = ScanScheduler::new(
+            dataset.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.object_store),
+        );
+        let mut supplied = FileMetadataMap::new();
+        for data_file in &fragment.metadata.files {
+            let path = dataset
+                .data_file_dir(data_file)
+                .unwrap()
+                .join(data_file.path.as_str());
+            let file = scheduler
+                .open_file(&path, &data_file.file_size_bytes)
+                .await
+                .unwrap();
+            supplied.insert(
+                (data_file.base_id, data_file.path.clone()),
+                fragment.get_file_metadata(&file).await.unwrap(),
+            );
+        }
+        dataset.object_store.io_stats_incremental();
+        assert_eq!(
+            fragment.get_deletion_vector().await.unwrap().unwrap().len(),
+            2
+        );
+        let deletion_io = dataset.object_store.io_stats_incremental();
+        let reader = fragment
+            .open(dataset.schema(), FragReadConfig::default(), Some(&supplied))
+            .await
+            .unwrap();
+        let open_io = dataset.object_store.io_stats_incremental();
+        // Deletion state still loads independently; neither physical footer reloads.
+        // Old manifests may require a second deletion-vector read to count rows.
+        let deletion_reads = if missing_deletion_count { 2 } else { 1 };
+        assert!(open_io.read_iops <= deletion_io.read_iops * deletion_reads);
+        assert!(open_io.read_bytes <= deletion_io.read_bytes * deletion_reads);
+        let batches = reader
+            .read_all(64)
+            .await
+            .unwrap()
+            .buffered(1)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 38);
+        assert_eq!(
+            batches[0]["i"]
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            2
+        );
+        assert_eq!(
+            batches[0]["extra"]
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            4
+        );
+    }
+
     #[tokio::test]
     async fn test_iops_read_small() {
         // Create a file that has 8 columns.
@@ -4077,7 +4237,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let session = Arc::new(Session::default());
+        let session = Arc::new(Session::new(0, 0, Default::default()));
         let write_params = WriteParams {
             session: Some(session.clone()),
             ..Default::default()
@@ -4101,7 +4261,7 @@ mod tests {
             .unwrap()
             .project_by_ids(&[0, 1, 2, 3, 4, 6, 7, 8, 9], true);
         let reader = fragment
-            .open(&projection, Default::default())
+            .open(&projection, Default::default(), None)
             .await
             .unwrap();
         let mut data = reader
@@ -4120,5 +4280,93 @@ mod tests {
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 1);
         assert_io_lt!(stats, read_bytes, 4096);
+
+        drop(reader);
+        let data_file = &fragment.metadata.files[0];
+        let path = dataset
+            .data_file_dir(data_file)
+            .unwrap()
+            .join(data_file.path.as_str());
+        let scheduler = ScanScheduler::new(
+            dataset.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.object_store),
+        );
+        let file = scheduler
+            .open_file(&path, &data_file.file_size_bytes)
+            .await
+            .unwrap();
+        let metadata = fragment.get_file_metadata(&file).await.unwrap();
+        let metadata_weak = Arc::downgrade(&metadata);
+        let supplied =
+            FileMetadataMap::from([((data_file.base_id, data_file.path.clone()), metadata)]);
+        session.file_metadata_cache().clear().await;
+        // The supplied footer must also avoid a HEAD when the manifest has no size hint.
+        let mut fragment = fragment;
+        fragment.metadata.files[0].file_size_bytes = CachedFileSize::unknown();
+        dataset.object_store.io_stats_incremental();
+        let mut readers = Vec::new();
+        for column in 0..8 {
+            let projection = fragment
+                .schema()
+                .project(&[format!("col_{column}")])
+                .unwrap();
+            readers.push(
+                fragment
+                    .open(&projection, FragReadConfig::default(), Some(&supplied))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let stats = dataset.object_store.io_stats_incremental();
+        assert_io_eq!(stats, read_iops, 0);
+        assert_io_eq!(stats, read_bytes, 0);
+
+        for mismatch in 0..3 {
+            let mut invalid = fragment.clone();
+            match mismatch {
+                0 => invalid.metadata.physical_rows = Some(2),
+                1 => invalid.metadata.files[0].file_minor_version += 1,
+                _ => invalid.metadata.files[0].file_size_bytes = CachedFileSize::new(1),
+            }
+            let error = invalid
+                .open(invalid.schema(), FragReadConfig::default(), Some(&supplied))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("Supplied file metadata does not match")
+            );
+        }
+
+        // A matching path under a different base is a miss, not a metadata hit.
+        let ((_, path), metadata) = supplied.iter().next().unwrap();
+        let other_base = FileMetadataMap::from([((Some(42), path.clone()), metadata.clone())]);
+        let fallback = fragment
+            .open(
+                fragment.schema(),
+                FragReadConfig::default(),
+                Some(&other_base),
+            )
+            .await
+            .unwrap();
+        assert!(dataset.object_store.io_stats_incremental().read_iops > 0);
+        drop(fallback);
+        drop(other_base);
+        drop(supplied);
+        assert!(metadata_weak.upgrade().is_some());
+        let batch = readers[3].take_as_batch(&[0], None).await.unwrap();
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            3
+        );
+        drop(readers);
+        assert!(metadata_weak.upgrade().is_none());
     }
 }

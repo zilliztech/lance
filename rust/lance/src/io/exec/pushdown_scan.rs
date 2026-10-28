@@ -304,7 +304,7 @@ impl FragmentScanner {
         if let Some(file_reader_options) = config.file_reader_options.clone() {
             frag_config = frag_config.with_file_reader_options(file_reader_options);
         }
-        let mut reader = fragment.open(dataset.schema(), frag_config).await?;
+        let mut reader = fragment.open(dataset.schema(), frag_config, None).await?;
         if config.make_deletions_null {
             reader.with_make_deletions_null();
         }

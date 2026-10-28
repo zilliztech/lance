@@ -744,7 +744,7 @@ async fn test_write_params(
     for fragment in &fragments {
         assert_eq!(fragment.count_rows(None).await.unwrap(), 100);
         let reader = fragment
-            .open(dataset.schema(), FragReadConfig::default())
+            .open(dataset.schema(), FragReadConfig::default(), None)
             .await
             .unwrap();
         // No group / batch concept in v2
