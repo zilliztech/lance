@@ -669,6 +669,12 @@ pub struct FragReadConfig {
     pub reader_priority: Option<u32>,
     /// File reader options to use when reading data files.
     pub file_reader_options: Option<FileReaderOptions>,
+    /// Preloaded deletion state for this fragment and dataset snapshot.
+    /// When absent, opening the fragment loads it through the dataset cache.
+    pub deletion_vector: Option<Arc<DeletionVector>>,
+    /// Preloaded stable row IDs for this fragment and dataset snapshot.
+    /// When absent, opening the fragment uses the dataset's normal loading path.
+    pub row_id_sequence: Option<Arc<RowIdSequence>>,
 }
 
 /// Loaded v2 file metadata, keyed by the manifest's `(base_id, path)`.
@@ -715,6 +721,18 @@ impl FragReadConfig {
 
     pub fn with_file_reader_options(mut self, value: FileReaderOptions) -> Self {
         self.file_reader_options = Some(value);
+        self
+    }
+
+    /// Reuse decoded deletions from the same fragment and dataset snapshot.
+    pub fn with_deletion_vector(mut self, value: Arc<DeletionVector>) -> Self {
+        self.deletion_vector = Some(value);
+        self
+    }
+
+    /// Reuse stable row IDs loaded from the same fragment and dataset snapshot.
+    pub fn with_row_id_sequence(mut self, value: Arc<RowIdSequence>) -> Self {
+        self.row_id_sequence = Some(value);
         self
     }
 }
@@ -923,14 +941,18 @@ impl FileFragment {
         file_metadata: Option<&FileMetadataMap>,
     ) -> Result<FragmentReader> {
         let open_files = self.open_readers(projection, &read_config, file_metadata);
-        let deletion_vec_load = self.get_deletion_vector();
+        let deletion_vec_load = async {
+            match &read_config.deletion_vector {
+                Some(vector) => Ok(Some(vector.clone())),
+                None => self.get_deletion_vector().await,
+            }
+        };
 
-        let row_id_load = if self.dataset.manifest.uses_stable_row_ids() {
-            futures::future::Either::Left(
-                load_row_id_sequence(&self.dataset, &self.metadata).map_ok(Some),
-            )
-        } else {
-            futures::future::Either::Right(futures::future::ready(Ok(None)))
+        let row_id_load = async {
+            match &read_config.row_id_sequence {
+                Some(sequence) => Ok(Some(sequence.clone())),
+                None => self.get_row_id_sequence().await,
+            }
         };
 
         let (opened_files, deletion_vec, row_id_sequence) =
@@ -948,6 +970,19 @@ impl FileFragment {
         }
 
         let num_physical_rows = self.physical_rows().await?;
+        // The vector is already loaded, including for manifests that omit the
+        // deletion count. Counting through the fragment would load it again.
+        let num_deletions = deletion_vec.as_ref().map_or(0, |vector| vector.len());
+        let num_rows = num_physical_rows
+            .checked_sub(num_deletions)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Fragment {} has {} deletions but only {} physical rows",
+                    self.id(),
+                    num_deletions,
+                    num_physical_rows
+                ))
+            })?;
 
         let mut reader = FragmentReader::try_new(
             self.id(),
@@ -955,7 +990,7 @@ impl FileFragment {
             row_id_sequence,
             opened_files,
             ArrowSchema::from(projection),
-            self.count_rows(None).await?,
+            num_rows,
             num_physical_rows,
             Arc::new(self.metadata.clone()),
         )?;
@@ -1496,6 +1531,18 @@ impl FileFragment {
             read_dataset_deletion_file(&self.dataset, self.id() as u64, deletion_file).await?;
 
         Ok(Some(deletion_vector))
+    }
+
+    /// Load this fragment's stable row IDs through the dataset metadata cache.
+    /// Returns `None` when the dataset does not use stable row IDs.
+    pub async fn get_row_id_sequence(&self) -> Result<Option<Arc<RowIdSequence>>> {
+        if self.dataset.manifest.uses_stable_row_ids() {
+            load_row_id_sequence(&self.dataset, &self.metadata)
+                .await
+                .map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Get the file metadata for this fragment, using the cache if available.
@@ -2197,6 +2244,11 @@ impl FragmentReader {
         })
     }
 
+    /// Number of visible rows, excluding the deletions loaded when opening.
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
     pub(crate) fn with_row_id(&mut self) -> &mut Self {
         self.with_row_id = true;
         self.output_schema = self
@@ -2816,6 +2868,7 @@ mod tests {
     use lance_file::version::LanceFileVersion;
     use lance_file::writer::FileWriterOptions;
     use lance_io::{assert_io_eq, assert_io_lt, object_store::ObjectStore};
+    use lance_table::format::{ExternalFile, RowIdMeta};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use std::collections::HashMap;
@@ -4126,10 +4179,106 @@ mod tests {
     }
 
     #[rstest]
+    #[tokio::test]
+    async fn test_open_with_row_id_sequence(
+        #[values(false, true)] external: bool,
+        #[values(false, true)] supplied: bool,
+    ) {
+        let test_dir = TempStrDir::default();
+        let batch = arrow_array::record_batch!(("i", Int32, [1, 2, 3])).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            &test_dir,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut manifest = dataset.manifest().clone();
+        if external {
+            let Some(RowIdMeta::Inline(data)) = &manifest.fragments[0].row_id_meta else {
+                panic!("small fixture should have inline row IDs");
+            };
+            let size = data.len() as u64;
+            dataset
+                .object_store
+                .put(&dataset.base.join("row_ids.bin"), data)
+                .await
+                .unwrap();
+            Arc::make_mut(&mut manifest.fragments)[0].row_id_meta =
+                Some(RowIdMeta::External(ExternalFile {
+                    path: "row_ids.bin".into(),
+                    offset: 0,
+                    size,
+                }));
+        }
+        let dataset = super::super::builder::DatasetBuilder::from_uri(&test_dir)
+            .with_serialized_manifest(&manifest.serialized())
+            .unwrap()
+            .with_session(Arc::new(Session::new(0, 0, Default::default())))
+            .load()
+            .await
+            .unwrap();
+        let fragment = dataset.get_fragment(0).unwrap();
+        let sequence = fragment.get_row_id_sequence().await.unwrap().unwrap();
+        let data_file = &fragment.metadata.files[0];
+        let scheduler = ScanScheduler::new(
+            dataset.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.object_store),
+        );
+        let file = scheduler
+            .open_file(
+                &dataset.data_dir().join(data_file.path.as_str()),
+                &data_file.file_size_bytes,
+            )
+            .await
+            .unwrap();
+        let footers = FileMetadataMap::from([(
+            (data_file.base_id, data_file.path.clone()),
+            fragment.get_file_metadata(&file).await.unwrap(),
+        )]);
+        let config = FragReadConfig::default().with_row_id(true);
+        let config = if supplied {
+            config.with_row_id_sequence(sequence.clone())
+        } else {
+            config
+        };
+        dataset.object_store.io_stats_incremental();
+        let reader = fragment
+            .open(dataset.schema(), config, Some(&footers))
+            .await
+            .unwrap();
+        let open_io = dataset.object_store.io_stats_incremental();
+        assert_eq!(open_io.read_iops, u64::from(external && !supplied));
+        assert_eq!(
+            Arc::ptr_eq(&sequence, reader.row_id_sequence.as_ref().unwrap()),
+            supplied
+        );
+        let batches = reader
+            .read_all(3)
+            .await
+            .unwrap()
+            .buffered(1)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let row_ids = batches[0][ROW_ID]
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(row_ids.values().as_ref(), &[0, 1, 2]);
+    }
+
+    #[rstest]
     #[case::known_deletion_count(false)]
     #[case::missing_deletion_count(true)]
     #[tokio::test]
-    async fn test_open_with_file_metadata_multiple_files(#[case] missing_deletion_count: bool) {
+    async fn test_open_with_file_metadata_multiple_files(
+        #[case] missing_deletion_count: bool,
+        #[values(false, true)] reuse_deletions: bool,
+    ) {
         let test_dir = TempStrDir::default();
         let mut dataset = create_dataset_v2(&test_dir).await;
         dataset
@@ -4178,21 +4327,26 @@ mod tests {
             );
         }
         dataset.object_store.io_stats_incremental();
-        assert_eq!(
-            fragment.get_deletion_vector().await.unwrap().unwrap().len(),
-            2
-        );
+        let deletions = fragment.get_deletion_vector().await.unwrap().unwrap();
+        assert_eq!(deletions.len(), 2);
         let deletion_io = dataset.object_store.io_stats_incremental();
+        assert!(deletion_io.read_iops > 0);
+        let config = if reuse_deletions {
+            FragReadConfig::default().with_deletion_vector(deletions)
+        } else {
+            FragReadConfig::default()
+        };
         let reader = fragment
-            .open(dataset.schema(), FragReadConfig::default(), Some(&supplied))
+            .open(dataset.schema(), config, Some(&supplied))
             .await
             .unwrap();
         let open_io = dataset.object_store.io_stats_incremental();
-        // Deletion state still loads independently; neither physical footer reloads.
-        // Old manifests may require a second deletion-vector read to count rows.
-        let deletion_reads = if missing_deletion_count { 2 } else { 1 };
-        assert!(open_io.read_iops <= deletion_io.read_iops * deletion_reads);
-        assert!(open_io.read_bytes <= deletion_io.read_bytes * deletion_reads);
+        // Supplied deletions skip all metadata I/O, even when the manifest omits
+        // their count. The default path loads the deletion file only once.
+        let deletion_reads = u64::from(!reuse_deletions);
+        assert_eq!(open_io.read_iops, deletion_io.read_iops * deletion_reads);
+        assert_eq!(open_io.read_bytes, deletion_io.read_bytes * deletion_reads);
+        assert_eq!(reader.num_rows(), 38);
         let batches = reader
             .read_all(64)
             .await
