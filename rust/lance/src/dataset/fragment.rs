@@ -1090,13 +1090,18 @@ impl FileFragment {
             };
             let supplied = file_metadata
                 .and_then(|metadata| metadata.get(&(data_file.base_id, data_file.path.clone())));
+            // V2.0 uses 0.3 in file footers and 2.0 in manifests; compare logical versions.
             if let Some(metadata) = supplied
-                && (u32::from(metadata.major_version) != data_file.file_major_version
-                    || u32::from(metadata.minor_version) != data_file.file_minor_version
-                    || self
-                        .metadata
-                        .physical_rows
-                        .is_some_and(|rows| rows as u64 != metadata.num_rows)
+                && (LanceFileVersion::try_from_major_minor(
+                    u32::from(metadata.major_version),
+                    u32::from(metadata.minor_version),
+                )? != LanceFileVersion::try_from_major_minor(
+                    data_file.file_major_version,
+                    data_file.file_minor_version,
+                )? || self
+                    .metadata
+                    .physical_rows
+                    .is_some_and(|rows| rows as u64 != metadata.num_rows)
                     || metadata.file_size_bytes == 0
                     || data_file
                         .file_size_bytes
@@ -4374,8 +4379,11 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::v2_0_alias(LanceFileVersion::V2_0)]
+    #[case::v2_1(LanceFileVersion::V2_1)]
     #[tokio::test]
-    async fn test_iops_read_small() {
+    async fn test_iops_read_small(#[case] data_storage_version: LanceFileVersion) {
         // Create a file that has 8 columns.
         let schema = Arc::new(ArrowSchema::new(
             (0..8)
@@ -4394,6 +4402,7 @@ mod tests {
         let session = Arc::new(Session::new(0, 0, Default::default()));
         let write_params = WriteParams {
             session: Some(session.clone()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let dataset = InsertBuilder::new("memory://test")
