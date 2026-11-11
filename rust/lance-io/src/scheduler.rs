@@ -4,7 +4,7 @@
 use bytes::Bytes;
 use futures::channel::oneshot;
 use futures::{FutureExt, TryFutureExt};
-use object_store::path::Path;
+use object_store::{Extensions, path::Path};
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::future::Future;
@@ -643,6 +643,44 @@ impl ScanScheduler {
         base_priority: u64,
         file_size_bytes: &CachedFileSize,
     ) -> Result<FileScheduler> {
+        self.open_file_with_priority_and_extensions(
+            path,
+            base_priority,
+            file_size_bytes,
+            Extensions::new(),
+        )
+        .await
+    }
+
+    /// Open a file and attach caller-specific context to its ObjectStore GET requests.
+    ///
+    /// Extensions are scoped to this file reader and follow its requests through the
+    /// shared scheduler. They are available in [`object_store::GetOptions::extensions`]
+    /// to stores that handle them.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_io::{scheduler::ScanScheduler, utils::CachedFileSize};
+    /// # use object_store::{Extensions, path::Path};
+    /// # #[derive(Clone)]
+    /// # struct ReadContext;
+    /// # async fn read(scheduler: &Arc<ScanScheduler>, path: &Path, size: &CachedFileSize) -> lance_core::Result<()> {
+    /// let mut extensions = Extensions::new();
+    /// extensions.insert(ReadContext);
+    /// let reader = scheduler
+    ///     .open_file_with_priority_and_extensions(path, 0, size, extensions)
+    ///     .await?;
+    /// let bytes = reader.submit_single(0..8, 0).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn open_file_with_priority_and_extensions(
+        self: &Arc<Self>,
+        path: &Path,
+        base_priority: u64,
+        file_size_bytes: &CachedFileSize,
+        extensions: Extensions,
+    ) -> Result<FileScheduler> {
         let file_size_bytes = if let Some(size) = file_size_bytes.get() {
             u64::from(size)
         } else {
@@ -654,7 +692,7 @@ impl ScanScheduler {
         };
         let reader = self
             .object_store
-            .open_with_size(path, file_size_bytes as usize)
+            .open_with_size_and_extensions(path, file_size_bytes as usize, extensions)
             .await?;
         let block_size = self.object_store.block_size() as u64;
         let max_iop_size = self.object_store.max_iop_size();
@@ -1027,6 +1065,7 @@ mod tests {
     use futures::poll;
     use lance_core::utils::tempfile::TempObjFile;
     use rand::RngCore;
+    use rstest::rstest;
 
     use object_store::{GetRange, ObjectStore as OSObjectStore, ObjectStoreExt, memory::InMemory};
     use tokio::{runtime::Handle, time::timeout};
@@ -1661,6 +1700,69 @@ mod tests {
         assert_eq!(bytes2[0].len(), 1000);
         assert_eq!(bytes3[0].len(), 1000);
         assert_eq!(get_range_count.load(Ordering::Acquire), 3);
+    }
+
+    #[rstest]
+    #[case::range_read(1024, true)]
+    #[case::small_file(16, false)]
+    #[tokio::test]
+    async fn test_file_scheduler_forwards_get_extensions(
+        #[case] file_size: u64,
+        #[case] has_range: bool,
+    ) {
+        #[derive(Clone, Debug)]
+        struct ReadContext;
+
+        let path = Path::parse("foo").unwrap();
+        let base_store = Arc::new(InMemory::new());
+        base_store
+            .put(&path, vec![7u8; file_size as usize].into())
+            .await
+            .unwrap();
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut store = MockObjectStore::default();
+        let recorded_options = observed.clone();
+        store.expect_get_opts().returning(move |location, options| {
+            recorded_options.lock().unwrap().push((
+                options.extensions.get::<ReadContext>().is_some(),
+                options.range.is_some(),
+            ));
+            let location = location.clone();
+            let base_store = base_store.clone();
+            async move { base_store.get_opts(&location, options).await }.boxed()
+        });
+
+        let object_store = Arc::new(ObjectStore::new(
+            Arc::new(store),
+            Url::parse("mem://").unwrap(),
+            Some(64),
+            None,
+            false,
+            false,
+            1,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+        let scheduler = ScanScheduler::new(object_store, SchedulerConfig::default_for_testing());
+        let file_size = CachedFileSize::new(file_size);
+        let mut extensions = Extensions::new();
+        extensions.insert(ReadContext);
+        let tagged_reader = scheduler
+            .open_file_with_priority_and_extensions(&path, 0, &file_size, extensions)
+            .await
+            .unwrap();
+        let default_reader = scheduler.open_file(&path, &file_size).await.unwrap();
+
+        let (tagged, default) = tokio::join!(
+            tagged_reader.submit_single(1..3, 0),
+            default_reader.submit_single(1..3, 0),
+        );
+        assert_eq!(tagged.unwrap(), Bytes::from_static(&[7, 7]));
+        assert_eq!(default.unwrap(), Bytes::from_static(&[7, 7]));
+        let mut observed = observed.lock().unwrap();
+        observed.sort_unstable();
+        assert_eq!(*observed, [(false, has_range), (true, has_range)]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
