@@ -25,7 +25,7 @@ use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::aws::AwsCredentialProvider;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
-use object_store::{ObjectMeta, ObjectStore as OSObjectStore, path::Path};
+use object_store::{Extensions, ObjectMeta, ObjectStore as OSObjectStore, path::Path};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
 use tokio::io::AsyncWriteExt;
@@ -657,14 +657,25 @@ impl ObjectStore {
     /// cached metadata. By passing in the known size, we can skip a HEAD / metadata
     /// call.
     pub async fn open_with_size(&self, path: &Path, known_size: usize) -> Result<Box<dyn Reader>> {
+        self.open_with_size_and_extensions(path, known_size, Extensions::new())
+            .await
+    }
+
+    pub(crate) async fn open_with_size_and_extensions(
+        &self,
+        path: &Path,
+        known_size: usize,
+        extensions: Extensions,
+    ) -> Result<Box<dyn Reader>> {
         // If we know the file is really small, we can read the whole thing
         // as a single request.
         if known_size <= self.block_size {
-            return Ok(Box::new(SmallReader::new(
+            return Ok(Box::new(SmallReader::new_with_extensions(
                 self.inner.clone(),
                 path.clone(),
                 self.download_retry_count,
                 known_size,
+                extensions,
             )));
         }
 
@@ -703,13 +714,16 @@ impl ObjectStore {
                     .await
                 }
             }
-            _ => Ok(Box::new(CloudObjectReader::new(
-                self.inner.clone(),
-                path.clone(),
-                self.block_size,
-                Some(known_size),
-                self.download_retry_count,
-            )?)),
+            _ => Ok(Box::new(
+                CloudObjectReader::new(
+                    self.inner.clone(),
+                    path.clone(),
+                    self.block_size,
+                    Some(known_size),
+                    self.download_retry_count,
+                )?
+                .with_extensions(extensions),
+            )),
         }
     }
 

@@ -19,7 +19,9 @@ use futures::{
 };
 use lance_core::{Error, Result, error::CloneableError};
 use object_store::ObjectStoreExt;
-use object_store::{GetOptions, GetResult, ObjectStore, Result as OSResult, path::Path};
+use object_store::{
+    Extensions, GetOptions, GetResult, ObjectStore, Result as OSResult, path::Path,
+};
 use tokio::sync::OnceCell;
 use tracing::instrument;
 
@@ -71,6 +73,7 @@ pub struct CloudObjectReader {
 
     block_size: usize,
     download_retry_count: usize,
+    extensions: Extensions,
 }
 
 impl DeepSizeOf for CloudObjectReader {
@@ -95,7 +98,13 @@ impl CloudObjectReader {
             size: OnceCell::new_with(known_size),
             block_size,
             download_retry_count,
+            extensions: Extensions::new(),
         })
+    }
+
+    pub(crate) fn with_extensions(mut self, extensions: Extensions) -> Self {
+        self.extensions = extensions;
+        self
     }
 }
 
@@ -199,6 +208,7 @@ impl Reader for CloudObjectReader {
                     }
                     .into(),
                 ),
+                extensions: self.extensions.clone(),
                 ..Default::default()
             },
         });
@@ -214,7 +224,7 @@ impl Reader for CloudObjectReader {
         let get_request = Arc::new(GetRequest {
             object_store: self.object_store.clone(),
             path: self.path.clone(),
-            options: GetOptions::default(),
+            options: GetOptions::default().with_extensions(self.extensions.clone()),
         });
         Box::pin(async move {
             do_get_with_outer_retry(self.download_retry_count, get_request, || {
@@ -228,7 +238,7 @@ impl Reader for CloudObjectReader {
         let get_request = Arc::new(GetRequest {
             object_store: self.object_store.clone(),
             path: self.path.clone(),
-            options: GetOptions::default(),
+            options: GetOptions::default().with_extensions(self.extensions.clone()),
         });
         Box::pin(async move {
             let get_request_clone = get_request.clone();
@@ -249,6 +259,7 @@ impl Reader for CloudObjectReader {
                     }
                     .into(),
                 ),
+                extensions: self.extensions.clone(),
                 ..Default::default()
             },
         });
@@ -305,6 +316,16 @@ impl SmallReader {
         download_retry_count: usize,
         size: usize,
     ) -> Self {
+        Self::new_with_extensions(store, path, download_retry_count, size, Extensions::new())
+    }
+
+    pub(crate) fn new_with_extensions(
+        store: Arc<dyn ObjectStore>,
+        path: Path,
+        download_retry_count: usize,
+        size: usize,
+        extensions: Extensions,
+    ) -> Self {
         let path_ref = path.clone();
         let state = SmallReaderState::Loading(
             Box::pin(async move {
@@ -312,6 +333,7 @@ impl SmallReader {
                     CloudObjectReader::new(store, path_ref, 0, None, download_retry_count)
                         .map_err(CloneableError)?;
                 object_reader
+                    .with_extensions(extensions)
                     .get_all()
                     .await
                     .map_err(|err| CloneableError(Error::from(err)))
